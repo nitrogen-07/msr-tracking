@@ -1,0 +1,211 @@
+name: Microsoft Rewards 24/7 Stock Tracker
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Trigger source (manual start or self-relay)"
+        required: false
+        default: "manual-or-relay"
+
+# Prevent overlapping workflow runs from colliding if manually triggered twice
+concurrency:
+  group: rewards-sku-tracker-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  track:
+    name: Poll SKU Availability (6-Hour Window)
+    runs-on: ubuntu-latest
+    # GitHub Actions hard job limit is 360 mins (6h). Set timeout to 355 mins
+    # while rewards_tracker.py self-terminates cleanly at 340 mins (5h 40m).
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi beautifulsoup4 lxml
+
+      - name: Run Microsoft Rewards Stock Monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REWARDS_COOKIE: ${{ secrets.REWARDS_COOKIE }}
+          REWARDS_SKU_ID: "000885000034"
+          REWARDS_SKU_URL: "https://rewards.bing.com/redeem/sku/000885000034"
+          STATE_FILE_PATH: "state_sku.json"
+          MAX_RUNTIME_SECONDS: "20400" # 5 hours 40 minutes
+          JITTER_MIN_SECONDS: "85"
+          JITTER_MAX_SECONDS: "110"
+        run: |
+          python rewards_tracker.py
+
+      - name: Commit and Push State File (state_sku.json)
+        if: always()
+        run: |
+          if [ ! -f state_sku.json ]; then
+            echo "No state_sku.json file found to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state_sku.json
+          if git diff --cached --quiet; then
+            echo "No changes in state_sku.json to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(state): update SKU 000885000034 state [skip ci]"
+
+          # Rebase safely against any concurrent upstream commits to prevent merge conflicts
+          for attempt in 1 2 3; do
+            if git pull --rebase -X theirs origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Successfully pushed updated state_sku.json on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push conflict on attempt ${attempt}, retrying in 3s..."
+            sleep 3
+          done
+
+          echo "Warning: Could not push state_sku.json after 3 attempts."
+
+      - name: Send Telegram Alert on Runner Failure or Cancellation
+        if: cancelled() || failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'EOF'
+          import html
+          import os
+          import urllib.request
+          import json
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+          status = os.getenv("JOB_STATUS", "unknown").upper()
+          run_url = os.getenv("RUN_URL", "")
+          workflow = os.getenv("WORKFLOW_NAME", "Microsoft Rewards Tracker")
+          run_id = os.getenv("RUN_ID", "")
+
+          if not token or not chat_id:
+              print("Telegram secrets missing; skipping failure alert.")
+              raise SystemExit(0)
+
+          icon = "🛑" if status == "CANCELLED" else "🚨"
+          message = (
+              f"{icon} <b>GITHUB ACTIONS RUNNER {html.escape(status)}</b>\n\n"
+              f"⚙️ <b>Workflow:</b> {html.escape(workflow)}\n"
+              f"🆔 <b>Run ID:</b> <code>{html.escape(run_id)}</code>\n"
+              f"⚠️ <b>Status:</b> <code>{html.escape(status)}</code>\n\n"
+              f"🔗 <a href=\"{html.escape(run_url)}\">View Workflow Run Logs</a>"
+          )
+
+          payload = json.dumps({
+              "chat_id": chat_id,
+              "text": message,
+              "parse_mode": "HTML",
+              "disable_web_page_preview": True,
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"Runner alert sent (HTTP {resp.status}).")
+          except Exception as exc:
+              print(f"Failed to send runner alert: {exc}")
+          EOF
+
+  relay:
+    name: Self-Relay Next 6-Hour Runner
+    needs: track
+    # Re-trigger automatically upon completion of the track job (unless manually cancelled)
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Trigger Next Workflow Run via GitHub CLI
+        env:
+          # Use a Personal Access Token (PAT_TOKEN) if provided, otherwise fall back to GITHUB_TOKEN
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Triggering next 6-hour relay cycle on branch ${GITHUB_REF_NAME}..."
+          gh workflow run "workflow.yml" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f reason="self-relay-from-run-${GITHUB_RUN_ID}"
+          echo "Successfully dispatched next workflow run."
+
+      - name: Notify Telegram if Relay Dispatch Fails
+        if: cancelled() || failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'EOF'
+          import html
+          import json
+          import os
+          import urllib.request
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+          run_url = os.getenv("RUN_URL", "")
+
+          if not token or not chat_id:
+              raise SystemExit(0)
+
+          message = (
+              "🚨 <b>SELF-RELAY FAILED: Microsoft Rewards Tracker</b>\n\n"
+              "The <code>relay</code> job failed to trigger the next 6-hour workflow run. "
+              "Continuous 24/7 monitoring is paused until manually restarted.\n\n"
+              f"🔗 <a href=\"{html.escape(run_url)}\">Inspect Failed Relay Run</a>"
+          )
+
+          payload = json.dumps({
+              "chat_id": chat_id,
+              "text": message,
+              "parse_mode": "HTML",
+          }).encode("utf-8")
+
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              urllib.request.urlopen(req, timeout=15)
+          except Exception as exc:
+              print(f"Failed to send relay failure alert: {exc}")
+          EOF
